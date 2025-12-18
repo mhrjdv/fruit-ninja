@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>AR Fruit Slicer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Courier New', Courier, monospace;
+        }
+
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        /* The webcam video is mirrored for natural interaction */
+        #input_video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); 
+            z-index: 0;
+        }
+
+        /* The 3D Canvas sits on top */
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        #score-board {
+            color: #fff;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 2px 2px 0 #000;
+        }
+
+        #start-screen {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            text-align: center;
+            pointer-events: auto;
+        }
+
+        button {
+            background: #ff4757;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 20px;
+            cursor: pointer;
+            margin-top: 20px;
+            border-radius: 5px;
+            font-family: inherit;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #ff6b81;
+        }
+
+        .loading {
+            color: #ffd700;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+    </style>
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+
+<div id="container">
+    <video id="input_video" playsinline></video>
+    <div id="ui-layer">
+        <div id="score-board">SCORE: 0 | LIVES: 3</div>
+    </div>
+    <div id="start-screen">
+        <h1>AR BLADE</h1>
+        <p>Use your index finger to slice.</p>
+        <p>Avoid the black bombs.</p>
+        <div id="loading-msg" class="loading">Loading Computer Vision Models...</div>
+        <button id="start-btn" style="display:none" onclick="startGame()">Start Camera</button>
+    </div>
+</div>
+
+<script>
+    // --- Global Configuration ---
+    const CONFIG = {
+        gravity: -9.8,
+        spawnRate: 1000, // ms
+        fruitVelocityY: { min: 8, max: 13 },
+        fruitVelocityX: { min: -3, max: 3 },
+        fruitZ: -10, // Depth where fruits spawn
+        bladeColor: 0x00ffff,
+        trailLength: 10
+    };
+
+    // --- State Management ---
+    let state = {
+        score: 0,
+        lives: 3,
+        isPlaying: false,
+        isGameOver: false,
+        lastSpawnTime: 0
+    };
+
+    // --- Three.js Globals ---
+    let scene, camera, renderer;
+    let clock = new THREE.Clock();
+    let fruits = []; // Holds active fruit objects
+    let particles = []; // Holds splice effects
+    let trailGeom, trailMesh; // The finger trail
+    let trailPositions = [];
+
+    // --- Hand Tracking Globals ---
+    let hands;
+    let cameraInput;
+    let fingerPos = new THREE.Vector3(0, 0, 0); // Projected 3D position of index finger
+    let isHandDetected = false;
+
+    // --- Audio ---
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    let audioCtx = new AudioContext();
+    
+    function playSound(type) {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        const now = audioCtx.currentTime;
+        
+        if (type === 'slice') {
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(800, now);
+            osc.frequency.exponentialRampToValueAtTime(100, now + 0.1);
+            gain.gain.setValueAtTime(0.5, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+            osc.start(now);
+            osc.stop(now + 0.1);
+        } else if (type === 'bomb') {
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(100, now);
+            osc.frequency.exponentialRampToValueAtTime(10, now + 0.5);
+            gain.gain.setValueAtTime(1, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+            osc.start(now);
+            osc.stop(now + 0.5);
+        }
+    }
+
+    // --- Initialization ---
+
+    function initThree() {
+        const container = document.getElementById('container');
+        
+        // Scene setup
+        scene = new THREE.Scene();
+        
+        // Camera setup - Perspective
+        const aspect = window.innerWidth / window.innerHeight;
+        camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 100);
+        camera.position.z = 5; // Camera sits back a bit
+
+        // Renderer with transparency for AR
+        renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 7);
+        scene.add(dirLight);
+
+        // Trail Setup
+        initTrail();
+
+        window.addEventListener('resize', onWindowResize, false);
+    }
+
+    function initTrail() {
+        // A simple ribbon trail for the finger
+        const geometry = new THREE.BufferGeometry();
+        // pre-allocate buffer
+        const maxPoints = 20; 
+        const positions = new Float32Array(maxPoints * 3);
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        
+        const material = new THREE.LineBasicMaterial({ 
+            color: CONFIG.bladeColor, 
+            linewidth: 5,
+            opacity: 0.8,
+            transparent: true
+        });
+
+        trailMesh = new THREE.Line(geometry, material);
+        trailMesh.frustumCulled = false; // Always render
+        scene.add(trailMesh);
+    }
+
+    function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // --- MediaPipe Setup ---
+    function initMediaPipe() {
+        const videoElement = document.getElementById('input_video');
+        
+        hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onHandsResults);
+
+        cameraInput = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+
+        // Show start button when MediaPipe is ready (approximated by delay here, logic handled in start)
+        setTimeout(() => {
+            document.getElementById('loading-msg').style.display = 'none';
+            document.getElementById('start-btn').style.display = 'block';
+        }, 1500); 
+    }
+
+    function onHandsResults(results) {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            isHandDetected = true;
+            // Get Index Finger Tip (Landmark 8) of the first hand
+            // Coordinates are 0-1 (normalized). 
+            // In MP, x is left-right (0-1), y is top-bottom (0-1).
+            // Input video is mirrored via CSS, so logic needs to account for that visual flip if needed.
+            // However, MP gives coordinates based on source image. 
+            // We flip X because we mirror the video element.
+            
+            const lm = results.multiHandLandmarks[0][8]; 
+            
+            // Map 2D normalized to 3D World at Depth Z
+            // Screen X: (1 - lm.x) because of mirroring
+            const x = (1 - lm.x) * 2 - 1; 
+            const y = (1 - lm.y) * 2 - 1;
+
+            // Project to the plane where fruits exist (CONFIG.fruitZ)
+            const vec = new THREE.Vector3(x, y, 0.5);
+            vec.unproject(camera);
+            
+            const dir = vec.sub(camera.position).normalize();
+            const distance = (CONFIG.fruitZ - camera.position.z) / dir.z;
+            const pos = camera.position.clone().add(dir.multiplyScalar(distance));
+            
+            fingerPos.copy(pos);
+            updateTrail(pos);
+
+        } else {
+            isHandDetected = false;
+        }
+    }
+
+    function updateTrail(pos) {
+        // Shift array
+        trailPositions.unshift(pos.clone());
+        if (trailPositions.length > CONFIG.trailLength) {
+            trailPositions.pop();
+        }
+
+        const positions = trailMesh.geometry.attributes.position.array;
+        let index = 0;
+        
+        for (let i = 0; i < trailPositions.length; i++) {
+            positions[index++] = trailPositions[i].x;
+            positions[index++] = trailPositions[i].y;
+            positions[index++] = trailPositions[i].z;
+        }
+        
+        // Fill rest with last point to prevent stray lines
+        const last = trailPositions[trailPositions.length-1] || new THREE.Vector3();
+        while(index < positions.length) {
+            positions[index++] = last.x;
+            positions[index++] = last.y;
+            positions[index++] = last.z;
+        }
+
+        trailMesh.geometry.attributes.position.needsUpdate = true;
+    }
+
+    // --- Game Logic ---
+
+    class Fruit {
+        constructor() {
+            this.type = Math.random() > 0.8 ? 'bomb' : 'fruit';
+            this.mesh = new THREE.Group();
+            
+            // Create Geometry
+            let geom, mat;
+            if (this.type === 'bomb') {
+                geom = new THREE.SphereGeometry(1, 16, 16);
+                mat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.2 });
+                const fuse = new THREE.Mesh(
+                    new THREE.CylinderGeometry(0.1, 0.1, 0.5),
+                    new THREE.MeshBasicMaterial({color: 0xff0000})
+                );
+                fuse.position.y = 1;
+                this.mesh.add(fuse);
+            } else {
+                // Random Fruit Color
+                const colors = [0xff0000, 0xffff00, 0x00ff00, 0xffa500]; // Apple, Lemon, Watermelon, Orange
+                const color = colors[Math.floor(Math.random() * colors.length)];
+                geom = new THREE.SphereGeometry(1, 16, 16);
+                mat = new THREE.MeshStandardMaterial({ color: color, roughness: 0.5 });
+            }
+            
+            const body = new THREE.Mesh(geom, mat);
+            this.mesh.add(body);
+            
+            // Physics Init
+            // Spawn at bottom, launch up
+            const startX = (Math.random() - 0.5) * 10;
+            this.mesh.position.set(startX, -10, CONFIG.fruitZ);
+            
+            this.velocity = new THREE.Vector3(
+                (Math.random() - 0.5) * 4, // Horizontal drift
+                Math.random() * (CONFIG.fruitVelocityY.max - CONFIG.fruitVelocityY.min) + CONFIG.fruitVelocityY.min, // Upward force
+                0
+            );
+
+            this.rotationAxis = new THREE.Vector3(Math.random(), Math.random(), Math.random()).normalize();
+            this.rotationSpeed = Math.random() * 0.2;
+
+            this.active = true;
+            this.radius = 1.2; // Hitbox radius
+
+            scene.add(this.mesh);
+        }
+
+        update(dt) {
+            if (!this.active) return;
+
+            // Apply Gravity
+            this.velocity.y += CONFIG.gravity * dt;
+            
+            // Move
+            this.mesh.position.add(this.velocity.clone().multiplyScalar(dt));
+            
+            // Rotate
+            this.mesh.rotateOnAxis(this.rotationAxis, this.rotationSpeed);
+
+            // Bounds check (fell off screen)
+            if (this.mesh.position.y < -15) {
+                this.remove();
+                if (this.type === 'fruit' && state.isPlaying) {
+                     // Missed fruit
+                     // Optional: lose life on miss? Let's keep it simple: only bombs kill.
+                }
+            }
+        }
+
+        checkCollision(pos) {
+            if (!this.active) return false;
+            // Simple distance check
+            const dist = this.mesh.position.distanceTo(pos);
+            return dist < this.radius;
+        }
+
+        slice() {
+            if (this.type === 'bomb') {
+                gameOver();
+                playSound('bomb');
+            } else {
+                state.score += 1;
+                updateUI();
+                spawnParticles(this.mesh.position, this.mesh.children[0].material.color);
+                playSound('slice');
+                this.remove();
+                
+                // Visual Split (Simplified: Spawn 2 smaller spheres flying apart)
+                spawnDebris(this.mesh.position, this.mesh.children[0].material.color);
+            }
+        }
+
+        remove() {
+            this.active = false;
+            scene.remove(this.mesh);
+        }
+    }
+
+    function spawnDebris(pos, color) {
+        for(let i=0; i<2; i++) {
+            const geom = new THREE.SphereGeometry(0.7, 8, 8);
+            const mat = new THREE.MeshStandardMaterial({ color: color });
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.position.copy(pos);
+            
+            // Explode outwards
+            const vel = new THREE.Vector3((Math.random()-0.5)*10, Math.random()*5, (Math.random()-0.5)*5);
+            
+            particles.push({
+                mesh: mesh,
+                velocity: vel,
+                life: 1.0
+            });
+            scene.add(mesh);
+        }
+    }
+
+    function spawnParticles(pos, color) {
+        // Juice effect
+        for(let i=0; i<10; i++) {
+            const geom = new THREE.BoxGeometry(0.2, 0.2, 0.2);
+            const mat = new THREE.MeshBasicMaterial({ color: color });
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.position.copy(pos);
+            mesh.position.x += (Math.random() - 0.5);
+            mesh.position.y += (Math.random() - 0.5);
+            
+            particles.push({
+                mesh: mesh,
+                velocity: new THREE.Vector3((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5),
+                life: 0.5
+            });
+            scene.add(mesh);
+        }
+    }
+
+    function updateParticles(dt) {
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i];
+            p.life -= dt;
+            p.velocity.y += CONFIG.gravity * dt;
+            p.mesh.position.add(p.velocity.clone().multiplyScalar(dt));
+            p.mesh.rotation.x += dt * 5;
+
+            if (p.life <= 0) {
+                scene.remove(p.mesh);
+                particles.splice(i, 1);
+            }
+        }
+    }
+
+    function startGame() {
+        document.getElementById('start-screen').style.display = 'none';
+        cameraInput.start();
+        state.isPlaying = true;
+        state.score = 0;
+        state.lives = 3;
+        state.isGameOver = false;
+        updateUI();
+        
+        // Start Render Loop
+        animate();
+    }
+
+    function gameOver() {
+        state.isPlaying = false;
+        state.isGameOver = true;
+        document.getElementById('start-screen').style.display = 'flex';
+        document.querySelector('#start-screen h1').innerText = "GAME OVER";
+        document.querySelector('#start-screen p').innerText = `Final Score: ${state.score}`;
+        document.getElementById('start-btn').innerText = "RESTART";
+        document.getElementById('loading-msg').style.display = 'none';
+        
+        // Clear board
+        fruits.forEach(f => f.remove());
+        fruits = [];
+    }
+
+    function updateUI() {
+        document.getElementById('score-board').innerText = `SCORE: ${state.score} | LIVES: ${state.lives}`;
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        const dt = clock.getDelta();
+        const now = clock.getElapsedTime();
+
+        if (state.isPlaying) {
+            // Spawning
+            if (now * 1000 - state.lastSpawnTime > CONFIG.spawnRate) {
+                fruits.push(new Fruit());
+                state.lastSpawnTime = now * 1000;
+                // Increase difficulty slightly
+                if(CONFIG.spawnRate > 400) CONFIG.spawnRate -= 5;
+            }
+
+            // Physics & Logic
+            // Iterate backwards to allow removal
+            for (let i = fruits.length - 1; i >= 0; i--) {
+                const f = fruits[i];
+                if (!f.active) {
+                    fruits.splice(i, 1);
+                    continue;
+                }
+                
+                f.update(dt);
+
+                // Collision Detection with Hand
+                // We check if hand is detected AND if velocity of hand is high enough (slicing motion)
+                // For simplicity in this demo, we just check position contact
+                if (isHandDetected) {
+                   if (f.checkCollision(fingerPos)) {
+                       f.slice();
+                   }
+                }
+            }
+        }
+
+        updateParticles(dt);
+        renderer.render(scene, camera);
+    }
+
+    // --- Boot ---
+    initThree();
+    initMediaPipe();
+
+</script>
+</body>
+</html>
